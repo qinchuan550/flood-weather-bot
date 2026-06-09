@@ -125,8 +125,10 @@ WEATHER_POINTS: List[WeatherPoint] = [
 # ====================================================
 
 def now_str() -> str:
-    """返回当前时间字符串。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    """返回北京时间字符串。"""
+    from datetime import timezone, timedelta
+    beijing_time = datetime.now(timezone(timedelta(hours=8)))
+    return beijing_time.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def extract_dingtalk_token(raw: str) -> str:
@@ -695,7 +697,7 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
     lines: List[str] = []
 
     lines.append(f"#  {REPORT_TITLE}")
-    lines.append(f"** {report_time}**")
+    lines.append(f"**发布时间：{report_time}**")
     lines.append("")
     lines.append("> 辅助研判，现场处置以正式预警、调度命令和现场检查为准。")
     lines.append("")
