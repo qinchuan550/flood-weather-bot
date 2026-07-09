@@ -5,19 +5,22 @@
 
 功能：
 1. 获取涪陵北、丰都、石柱、黄水、凉雾片区天气实况；
-2. 获取未来三天天气；
-3. 自动判断降雨、大风及综合防洪风险；
-4. 通过钉钉自定义机器人推送 Markdown 消息；
-5. 适合每天定时推送防洪天气日报。
+2. 获取未来七天天气；
+3. 自动判断降雨、大风、防胀高温及综合防洪防风风险；
+4. 生成五个片区近七天气温和降雨图示；
+5. 通过钉钉自定义机器人推送 Markdown 消息；
+6. 适合每天定时推送防洪防风防胀天气日报。
 
 依赖：
-pip install requests
+pip install requests matplotlib
 
 环境变量：
 DINGTALK_TOKEN      钉钉机器人 access_token，或者完整 Webhook
 DINGTALK_SECRET     钉钉机器人加签 secret；如果只设置关键词，可以为空
 QWEATHER_KEY        和风天气 API Key
 QWEATHER_HOST       和风天气控制台里的专属 API Host，例如 https://xxxx.qweatherapi.com
+CHART_OUTPUT        七天气温降雨图输出路径，默认 weather_7d_chart.png
+CHART_IMAGE_URL     可选，公网图片地址；配置后钉钉 Markdown 内直接显示图示
 
 PowerShell 本地测试示例：
 cd D:\\dev\\flood_weather_bot
@@ -40,6 +43,7 @@ import hashlib
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import requests
@@ -80,10 +84,17 @@ AT_ALL = False
 AT_MOBILES: List[str] = []
 
 # 钉钉关键词建议设置为：防洪
-REPORT_TITLE = "石柱车间防洪防风日报"
+REPORT_TITLE = "石柱车间防洪防风防胀日报"
 
 # 请求超时时间
 REQUEST_TIMEOUT = 20
+
+# 七天气温降雨图输出路径。GitHub Actions 会上传这个文件为运行产物。
+CHART_OUTPUT = os.getenv("CHART_OUTPUT", "weather_7d_chart.png").strip()
+
+# 如果有可公网访问的图片地址，可填这里，钉钉 Markdown 会直接内嵌图片。
+# 例如：https://example.com/weather_7d_chart.png
+CHART_IMAGE_URL = os.getenv("CHART_IMAGE_URL", "").strip()
 
 
 @dataclass
@@ -286,6 +297,31 @@ def overall_risk_icon(risk: str) -> str:
     return "🟢"
 
 
+def heat_level_by_temp(temp_max) -> Tuple[str, str, int]:
+    """
+    按未来 24 小时最高气温判断防胀高温预警。
+
+    口径：超过 35℃发布黄色，超过 37℃发布橙色，超过 40℃发布红色。
+    """
+    temp = safe_float(temp_max, -999)
+
+    if temp > 40:
+        return "红色", "🔴", 3
+    if temp > 37:
+        return "橙色", "🟠", 2
+    if temp > 35:
+        return "黄色", "🟡", 1
+    return "无预警", "🟢", 0
+
+
+def heat_alert_text(temp_max) -> str:
+    """返回防胀预警简短文本。"""
+    level, icon, _ = heat_level_by_temp(temp_max)
+    if level == "无预警":
+        return "防胀无预警"
+    return f"防胀{icon}{level}"
+
+
 # ====================================================
 # 五、钉钉机器人发送
 # ====================================================
@@ -482,6 +518,18 @@ def get_weather_3d(location: str) -> Dict:
     )
 
 
+def get_weather_7d(location: str) -> Dict:
+    """获取未来 7 天天气。"""
+    return qweather_get(
+        "/v7/weather/7d",
+        {
+            "location": location,
+            "lang": "zh",
+            "unit": "m",
+        },
+    )
+
+
 # ====================================================
 # 七、风险判断逻辑
 # ====================================================
@@ -572,7 +620,7 @@ def build_point_weather(point: WeatherPoint) -> Dict:
     location_id, resolved_name, adm2 = get_location_id(point.query)
 
     now_data = get_weather_now(location_id)
-    daily_data = get_weather_3d(location_id)
+    daily_data = get_weather_7d(location_id)
 
     now = now_data.get("now", {})
     daily = daily_data.get("daily", [])
@@ -581,7 +629,7 @@ def build_point_weather(point: WeatherPoint) -> Dict:
         raise RuntimeError(f"{point.name} 实况天气为空")
 
     if not daily:
-        raise RuntimeError(f"{point.name} 未来三天天气为空")
+        raise RuntimeError(f"{point.name} 未来七天天气为空")
 
     # 实况字段
     now_text = md_escape(now.get("text", "-"))
@@ -601,7 +649,10 @@ def build_point_weather(point: WeatherPoint) -> Dict:
     max_daily_risk_score = 0
     key_risks = []
 
-    for day in daily[:3]:
+    max_heat_score = 0
+    max_heat_day = None
+
+    for day in daily[:7]:
         fx_date = md_escape(day.get("fxDate", "-"))
         text_day = md_escape(day.get("textDay", "-"))
         text_night = md_escape(day.get("textNight", "-"))
@@ -614,6 +665,16 @@ def build_point_weather(point: WeatherPoint) -> Dict:
 
         rain_level, rain_desc = rain_level_by_daily_precip(precip)
         wind_level, wind_desc = wind_level_by_scale(wind_scale_day)
+        heat_level, heat_icon, heat_score = heat_level_by_temp(temp_max)
+        max_heat_score = max(max_heat_score, heat_score)
+        if max_heat_day is None or heat_score > max_heat_day["heatScore"]:
+            max_heat_day = {
+                "fxDate": fx_date,
+                "tempMax": temp_max,
+                "heatLevel": heat_level,
+                "heatIcon": heat_icon,
+                "heatScore": heat_score,
+            }
 
         score = risk_score(rain_level, wind_level)
         max_daily_risk_score = max(max_daily_risk_score, score)
@@ -643,6 +704,9 @@ def build_point_weather(point: WeatherPoint) -> Dict:
                 "rainDesc": rain_desc,
                 "windLevel": wind_level,
                 "windDesc": wind_desc,
+                "heatLevel": heat_level,
+                "heatIcon": heat_icon,
+                "heatScore": heat_score,
             }
         )
 
@@ -675,7 +739,89 @@ def build_point_weather(point: WeatherPoint) -> Dict:
         "keyRisks": key_risks,
         "overallRisk": overall_risk,
         "overallScore": overall_score,
+        "maxHeatScore": max_heat_score,
+        "maxHeatDay": max_heat_day,
     }
+
+
+def generate_weather_chart(results: List[Dict], output_path: str) -> str:
+    """生成五个片区未来七天气温和降雨图示。"""
+    if not results:
+        return ""
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib import font_manager
+    except Exception as exc:
+        print(f"[WARN] matplotlib 不可用，跳过图示生成：{exc}")
+        return ""
+
+    preferred_fonts = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "WenQuanYi Micro Hei",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
+    available_fonts = {font.name for font in font_manager.fontManager.ttflist}
+    for font_name in preferred_fonts:
+        if font_name in available_fonts:
+            plt.rcParams["font.sans-serif"] = [font_name]
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+    panel_count = len(results)
+    fig_height = max(3.0 * panel_count, 5.0)
+    fig, axes = plt.subplots(panel_count, 1, figsize=(13, fig_height), sharex=False)
+    if panel_count == 1:
+        axes = [axes]
+
+    for ax, item in zip(axes, results):
+        forecast = item.get("forecast", [])[:7]
+        dates = [day["fxDate"][-5:] for day in forecast]
+        temp_max = [safe_float(day["tempMax"], 0) for day in forecast]
+        temp_min = [safe_float(day["tempMin"], 0) for day in forecast]
+        precip = [safe_float(day["precip"], 0) for day in forecast]
+
+        ax.axhspan(35, 37, color="#fff3bf", alpha=0.55, label="黄色 >35℃")
+        ax.axhspan(37, 40, color="#ffd8a8", alpha=0.55, label="橙色 >37℃")
+        ax.axhspan(40, max(max(temp_max, default=40) + 2, 42), color="#ffc9c9", alpha=0.55, label="红色 >40℃")
+
+        line_max, = ax.plot(dates, temp_max, color="#d9480f", marker="o", linewidth=2.2, label="最高气温")
+        line_min, = ax.plot(dates, temp_min, color="#1971c2", marker="o", linewidth=2.0, label="最低气温")
+        ax.set_ylabel("气温(℃)")
+        ax.set_ylim(min(min(temp_min, default=20) - 2, 20), max(max(temp_max, default=40) + 2, 42))
+        ax.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.35)
+        ax.set_title(item["name"], loc="left", fontsize=13, fontweight="bold")
+
+        ax_rain = ax.twinx()
+        bars = ax_rain.bar(dates, precip, color="#74c0fc", alpha=0.55, width=0.45, label="降雨量")
+        ax_rain.set_ylabel("降雨(mm)")
+        ax_rain.set_ylim(0, max(max(precip, default=0) * 1.8, 5))
+
+        for date, high, low, rain in zip(dates, temp_max, temp_min, precip):
+            level, _, _ = heat_level_by_temp(high)
+            if level != "无预警":
+                ax.text(date, high + 0.4, level[0], ha="center", va="bottom", fontsize=11, fontweight="bold", color="#c92a2a")
+            if rain > 0:
+                ax_rain.text(date, rain + 0.1, f"{rain:.1f}", ha="center", va="bottom", fontsize=8, color="#1864ab")
+
+        ax.legend([line_max, line_min, bars], ["最高气温", "最低气温", "降雨量"], loc="upper right", ncols=3, fontsize=9)
+
+    fig.suptitle("五片区未来七天气温与降雨趋势", fontsize=18, fontweight="bold")
+    fig.text(0.5, 0.012, "防胀预警阈值：黄色 >35℃，橙色 >37℃，红色 >40℃", ha="center", fontsize=10, color="#495057")
+    fig.tight_layout(rect=[0, 0.025, 1, 0.97])
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output, dpi=180, bbox_inches="tight")
+    plt.close(fig)
+
+    return str(output)
 
 
 # ====================================================
@@ -713,12 +859,16 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
         for item in sorted_results:
             now = item["now"]
             icon = overall_risk_icon(item["overallRisk"])
+            today = item["forecast"][0] if item.get("forecast") else {}
+            today_temp_max = today.get("tempMax", "-")
 
             lines.append(
                 f"- {icon} **{item['name']}**：**{item['overallRisk']}**，"
+                f"{heat_alert_text(today_temp_max)}，"
                 f"{weather_icon(now['text'])}{now['text']}，"
                 f"雨{now['precip']:.1f}mm，"
-                f"{now['windDir']}{now['windScale']}级"
+                f"{now['windDir']}{now['windScale']}级，"
+                f"24h最高{today_temp_max}℃"
             )
     else:
         lines.append("- ⚠️ 未获取到有效天气数据。")
@@ -761,7 +911,7 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
         for item in results:
             forecast_texts = []
 
-            for day in item["forecast"]:
+            for day in item["forecast"][:3]:
                 w_icon = weather_icon(day["textDay"] + day["textNight"])
                 r_icon = rain_icon(day["rainLevel"])
 
@@ -769,7 +919,8 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
                     f"{day['fxDate'][-5:]} {w_icon}{day['textDay']}/{day['textNight']} "
                     f"{day['tempMin']}～{day['tempMax']}℃ "
                     f"雨{day['precip']:.1f}mm {r_icon}{day['rainLevel']} "
-                    f"{day['windDirDay']}{day['windScaleDay']}级"
+                    f"{day['windDirDay']}{day['windScaleDay']}级 "
+                    f"{heat_alert_text(day['tempMax'])}"
                 )
 
             lines.append(f"- **{item['name']}**：")
@@ -782,8 +933,47 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
     lines.append("---")
     lines.append("")
 
-    # 四、防洪风险提示
-    lines.append("## 四、防洪风险提示")
+    # 四、防胀气温预警
+    lines.append("## 四、防胀气温预警")
+
+    if results:
+        heat_items = [
+            x for x in sorted(results, key=lambda item: item.get("maxHeatScore", 0), reverse=True)
+            if x.get("maxHeatScore", 0) > 0
+        ]
+
+        if heat_items:
+            for item in heat_items:
+                heat_day = item.get("maxHeatDay") or {}
+                lines.append(
+                    f"- {heat_day.get('heatIcon', '🟡')} **{item['name']}**："
+                    f"未来七天最高{heat_day.get('tempMax', '-')}℃"
+                    f"（{heat_day.get('fxDate', '-')[-5:]}），"
+                    f"触发防胀{heat_day.get('heatLevel', '黄色')}预警。"
+                )
+            lines.append("- 建议重点关注 12:00—17:00 高温时段，结合轨温、锁定轨温、线路方向及设备状态开展现场复核。")
+        else:
+            lines.append("- 🟢 未来七天最高气温暂未超过 35℃，暂不触发防胀高温预警。")
+    else:
+        lines.append("- ⚠️ 天气数据获取异常，请人工复核高温防胀风险。")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # 五、未来七天气温降雨图示
+    lines.append("## 五、未来七天气温降雨图示")
+    if CHART_IMAGE_URL:
+        lines.append(f"![五片区未来七天气温降雨图]({CHART_IMAGE_URL})")
+    else:
+        lines.append(f"- 已生成图示文件：`{CHART_OUTPUT}`。如需在钉钉消息内直接显示图片，请配置 `CHART_IMAGE_URL` 为公网图片地址。")
+
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # 六、防洪防风风险提示
+    lines.append("## 六、防洪防风风险提示")
 
     if results:
         sorted_results = sorted(results, key=lambda x: x["overallScore"], reverse=True)
@@ -815,7 +1005,7 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
             lines.append(f"- ⚠️ **{item['name']}**：天气数据获取失败，建议人工复核。")
 
     lines.append("")
-    lines.append("> 本消息为石柱综合维修车间工务防洪防风机器人辅助提醒。")
+    lines.append("> 本消息为石柱综合维修车间工务防洪防风防胀机器人辅助提醒。")
 
     return "\n".join(lines)
 
@@ -862,6 +1052,10 @@ def main() -> None:
                 }
             )
             print(f"[ERROR] {point.name} 获取失败：{error_msg}")
+
+    chart_path = generate_weather_chart(results, CHART_OUTPUT)
+    if chart_path:
+        print(f"[OK] 七天气温降雨图已生成：{chart_path}")
 
     markdown_text = build_markdown_report(results, failed)
 
