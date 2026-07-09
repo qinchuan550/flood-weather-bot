@@ -13,6 +13,8 @@ on:
 jobs:
   send-weather-report:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
@@ -33,21 +35,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run flood weather bot
+      - name: Generate report and chart
         env:
           DINGTALK_TOKEN: ${{ secrets.DINGTALK_TOKEN }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
           QWEATHER_KEY: ${{ secrets.QWEATHER_KEY }}
           QWEATHER_HOST: ${{ secrets.QWEATHER_HOST }}
-          CHART_OUTPUT: weather_7d_chart.png
-          CHART_IMAGE_URL: ${{ secrets.CHART_IMAGE_URL }}
+          CHART_OUTPUT: public/weather_7d_chart.png
+          CHART_IMAGE_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.ref_name }}/public/weather_7d_chart.png
+          REPORT_OUTPUT: report.md
+          SEND_DINGTALK: "false"
         run: |
           python flood_weather_bot.py
+
+      - name: Publish chart to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/weather_7d_chart.png
+          if git diff --cached --quiet; then
+            echo "No chart changes to commit."
+          else
+            git commit -m "Update weather chart"
+            git push
+          fi
+
+      - name: Send DingTalk report
+        env:
+          DINGTALK_TOKEN: ${{ secrets.DINGTALK_TOKEN }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import flood_weather_bot as bot
+
+          markdown_text = Path("report.md").read_text(encoding="utf-8")
+          bot.send_dingtalk_markdown(bot.REPORT_TITLE, markdown_text)
+          PY
 
       - name: Upload seven-day chart
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: weather-7d-chart
-          path: weather_7d_chart.png
+          path: public/weather_7d_chart.png
           if-no-files-found: ignore
