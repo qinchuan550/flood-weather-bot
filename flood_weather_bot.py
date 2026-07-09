@@ -21,6 +21,8 @@ QWEATHER_KEY        和风天气 API Key
 QWEATHER_HOST       和风天气控制台里的专属 API Host，例如 https://xxxx.qweatherapi.com
 CHART_OUTPUT        七天气温降雨图输出路径，默认 weather_7d_chart.png
 CHART_IMAGE_URL     可选，公网图片地址；配置后钉钉 Markdown 内直接显示图示
+SEND_DINGTALK       是否推送钉钉，默认 true；设为 false 时只生成内容
+REPORT_OUTPUT       可选，保存本次 Markdown 报告文本
 
 PowerShell 本地测试示例：
 cd D:\\dev\\flood_weather_bot
@@ -95,6 +97,10 @@ CHART_OUTPUT = os.getenv("CHART_OUTPUT", "weather_7d_chart.png").strip()
 # 如果有可公网访问的图片地址，可填这里，钉钉 Markdown 会直接内嵌图片。
 # 例如：https://example.com/weather_7d_chart.png
 CHART_IMAGE_URL = os.getenv("CHART_IMAGE_URL", "").strip()
+
+# GitHub Actions 可先生成报告和图片，提交图片后再单独推送已保存的报告。
+SEND_DINGTALK = os.getenv("SEND_DINGTALK", "true").strip().lower() not in ("0", "false", "no")
+REPORT_OUTPUT = os.getenv("REPORT_OUTPUT", "").strip()
 
 
 @dataclass
@@ -649,6 +655,12 @@ def build_point_weather(point: WeatherPoint) -> Dict:
     max_daily_risk_score = 0
     key_risks = []
 
+    if now_rain_level in ["关注", "较高", "高", "特高"]:
+        key_risks.append(f"实况降雨{now_precip:.1f}mm，降雨风险{now_rain_level}")
+
+    if now_wind_level in ["关注", "较高", "高"]:
+        key_risks.append(f"实况{now_wind_dir}{now_wind_scale}级，风风险{now_wind_level}")
+
     max_heat_score = 0
     max_heat_day = None
 
@@ -863,12 +875,11 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
             today_temp_max = today.get("tempMax", "-")
 
             lines.append(
-                f"- {icon} **{item['name']}**：**{item['overallRisk']}**，"
+                f"- {icon} **{item['name']}**：{item['overallRisk']}，"
                 f"{heat_alert_text(today_temp_max)}，"
                 f"{weather_icon(now['text'])}{now['text']}，"
-                f"雨{now['precip']:.1f}mm，"
-                f"{now['windDir']}{now['windScale']}级，"
-                f"24h最高{today_temp_max}℃"
+                f"{now['temp']}℃，雨{now['precip']:.1f}mm，"
+                f"{now['windDir']}{now['windScale']}级"
             )
     else:
         lines.append("- ⚠️ 未获取到有效天气数据。")
@@ -881,31 +892,8 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
     lines.append("---")
     lines.append("")
 
-    # 二、天气实况
-    lines.append("## 二、天气实况")
-
-    if results:
-        for item in results:
-            now = item["now"]
-            r_icon = rain_icon(now["rainLevel"])
-            wd_icon = wind_icon(now["windLevel"])
-
-            lines.append(
-                f"- **{item['name']}**："
-                f"{weather_icon(now['text'])}{now['text']}，"
-                f"{now['temp']}℃，"
-                f"雨 **{now['precip']:.1f}mm** {r_icon}{now['rainLevel']}，"
-                f"{wd_icon}{now['windDir']}{now['windScale']}级"
-            )
-    else:
-        lines.append("- ⚠️ 暂无实况数据。")
-
-    lines.append("")
-    lines.append("---")
-    lines.append("")
-
-    # 三、未来三天
-    lines.append("## 三、未来三天")
+    # 二、未来三天
+    lines.append("## 二、未来三天")
 
     if results:
         for item in results:
@@ -916,10 +904,9 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
                 r_icon = rain_icon(day["rainLevel"])
 
                 forecast_texts.append(
-                    f"{day['fxDate'][-5:]} {w_icon}{day['textDay']}/{day['textNight']} "
-                    f"{day['tempMin']}～{day['tempMax']}℃ "
-                    f"雨{day['precip']:.1f}mm {r_icon}{day['rainLevel']} "
-                    f"{day['windDirDay']}{day['windScaleDay']}级 "
+                    f"{day['fxDate'][-5:]} {w_icon}{day['textDay']}/{day['textNight']}，"
+                    f"{day['tempMin']}～{day['tempMax']}℃，"
+                    f"雨{day['precip']:.1f}mm，"
                     f"{heat_alert_text(day['tempMax'])}"
                 )
 
@@ -933,8 +920,8 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
     lines.append("---")
     lines.append("")
 
-    # 四、防胀气温预警
-    lines.append("## 四、防胀气温预警")
+    # 三、防胀气温预警
+    lines.append("## 三、防胀气温预警")
 
     if results:
         heat_items = [
@@ -951,7 +938,7 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
                     f"（{heat_day.get('fxDate', '-')[-5:]}），"
                     f"触发防胀{heat_day.get('heatLevel', '黄色')}预警。"
                 )
-            lines.append("- 建议重点关注 12:00—17:00 高温时段，结合轨温、锁定轨温、线路方向及设备状态开展现场复核。")
+            lines.append("- 建议重点关注 12:00—17:00 高温时段，结合轨温和线路状态现场复核。")
         else:
             lines.append("- 🟢 未来七天最高气温暂未超过 35℃，暂不触发防胀高温预警。")
     else:
@@ -961,19 +948,17 @@ def build_markdown_report(results: List[Dict], failed: List[Dict]) -> str:
     lines.append("---")
     lines.append("")
 
-    # 五、未来七天气温降雨图示
-    lines.append("## 五、未来七天气温降雨图示")
     if CHART_IMAGE_URL:
+        # 四、未来七天气温降雨图示
+        lines.append("## 四、未来七天气温降雨图示")
         lines.append(f"![五片区未来七天气温降雨图]({CHART_IMAGE_URL})")
-    else:
-        lines.append(f"- 已生成图示文件：`{CHART_OUTPUT}`。如需在钉钉消息内直接显示图片，请配置 `CHART_IMAGE_URL` 为公网图片地址。")
 
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
-    # 六、防洪防风风险提示
-    lines.append("## 六、防洪防风风险提示")
+    # 防洪防风风险提示
+    lines.append("## 防洪防风风险提示")
 
     if results:
         sorted_results = sorted(results, key=lambda x: x["overallScore"], reverse=True)
@@ -1063,6 +1048,16 @@ def main() -> None:
     print("生成推送内容：")
     print(markdown_text)
     print("=" * 80)
+
+    if REPORT_OUTPUT:
+        report_path = Path(REPORT_OUTPUT)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(markdown_text, encoding="utf-8")
+        print(f"[OK] Markdown 报告已保存：{report_path}")
+
+    if not SEND_DINGTALK:
+        print("[SKIP] SEND_DINGTALK=false，跳过钉钉推送。")
+        return
 
     send_dingtalk_markdown(REPORT_TITLE, markdown_text)
 
